@@ -14,7 +14,7 @@ import os
 import tkinter as tk
 from tkinter import filedialog, messagebox
 
-from codec import encode, decode
+from codec import encode, decode, analyze
 
 BLACK, WHITE = 0x00, 0xFF
 MAX_DIM = 200
@@ -58,14 +58,83 @@ def save_compressed(path: str, w: int, h: int, pixels: bytes) -> int:
     return len(data)
 
 
-def load_compressed(path: str):
+def load_compressed_stream(path: str):
+    """Return (w, h, rle_stream) without decoding."""
     with open(path, "rb") as f:
-        w, h, stream = _parse_header(f.read())
+        return _parse_header(f.read())
+
+
+def load_compressed(path: str):
+    w, h, stream = load_compressed_stream(path)
     pixels = decode(stream)
     if len(pixels) != w * h:
         raise ValueError("Decoded size does not match width x height "
                          "(corrupted file?)")
     return w, h, pixels
+
+
+# ---------------------------------------------------------- details report
+MAX_TABLE_ROWS = 1000
+
+
+def _px_name(v: int) -> str:
+    return "WHITE (FF)" if v == WHITE else "BLACK (00)"
+
+
+def build_report(w: int, h: int, pixels: bytes, stream: bytes, title: str) -> str:
+    """Human-readable description of a compressed stream."""
+    blocks = analyze(stream)
+    runs = [b for b in blocks if b["type"] == "RUN"]
+    lits = [b for b in blocks if b["type"] == "LITERAL"]
+    n_pix = w * h
+    raw_size = HEADER_SIZE + n_pix
+    comp_size = HEADER_SIZE + len(stream)
+    ratio = comp_size / raw_size * 100
+    gain = 100 - ratio
+    in_runs = sum(b["count"] for b in runs)
+    in_lits = sum(b["count"] for b in lits)
+    white = pixels.count(WHITE)
+    black = pixels.count(BLACK)
+
+    L = []
+    L.append(f"=== {title} ===")
+    L.append(f"Image size        : {w} x {h} = {n_pix} pixels "
+             f"({black} black, {white} white)")
+    L.append(f"Raw file size     : {raw_size} bytes  (4 header + {n_pix} pixel bytes)")
+    L.append(f"Compressed size   : {comp_size} bytes  (4 header + {len(stream)} RLE bytes)")
+    L.append(f"Compression ratio : {ratio:.1f}% of original  |  compression factor "
+             f"{raw_size / comp_size:.2f}:1")
+    if gain >= 0:
+        L.append(f"Space saved       : {gain:.1f}%  ({raw_size - comp_size} bytes)")
+    else:
+        L.append(f"Space saved       : NONE - file is {-gain:.1f}% LARGER "
+                 f"({comp_size - raw_size} byte(s) more). RLE works poorly on noisy images.")
+    L.append(f"Average bits/pixel: {comp_size * 8 / n_pix:.3f}  (raw = 8.000)")
+    L.append("")
+    L.append(f"Blocks            : {len(blocks)} total = {len(runs)} RUN + {len(lits)} LITERAL")
+    L.append(f"Pixels in runs    : {in_runs}  ({in_runs / n_pix * 100:.1f}%)"
+             f"   |   in literals: {in_lits}  ({in_lits / n_pix * 100:.1f}%)")
+    if runs:
+        big = max(runs, key=lambda b: b["count"])
+        L.append(f"Longest run       : {big['count']} x {_px_name(big['pixel'])}")
+    if lits:
+        L.append(f"Longest literal   : {max(b['count'] for b in lits)} pixels")
+    L.append(f"Bytes used by     : run blocks = {sum(b['size'] for b in runs)}, "
+             f"literal blocks = {sum(b['size'] for b in lits)}")
+    L.append("")
+    L.append(f"{'#':>4}  {'Offset':>6}  {'Type':<8} {'Header':<6}  {'Count':>6}  {'Bytes':>5}  Content")
+    L.append("-" * 78)
+    for k, b in enumerate(blocks[:MAX_TABLE_ROWS], 1):
+        if b["type"] == "RUN":
+            content = f"{b['count']} x {_px_name(b['pixel'])}"
+        else:
+            txt = "".join("W" if v == WHITE else "B" for v in b["content"][:36])
+            content = txt + ("..." if b["count"] > 36 else "")
+        L.append(f"{k:>4}  {b['offset']:>6}  {b['type']:<8} {b['header'].hex().upper():<6}  "
+                 f"{b['count']:>6}  {b['size']:>5}  {content}")
+    if len(blocks) > MAX_TABLE_ROWS:
+        L.append(f"... {len(blocks) - MAX_TABLE_ROWS} more blocks not shown")
+    return "\n".join(L)
 
 
 # ------------------------------------------------------------- pixel grid
@@ -170,9 +239,27 @@ class App(tk.Tk):
         tk.Label(self, textvariable=self.status, anchor="w", justify="left",
                  padx=8, pady=6, relief="sunken").pack(fill="x", side="bottom")
 
+        # --- compression details panel
+        det = tk.LabelFrame(self, text="Compression details", padx=6, pady=6)
+        det.pack(fill="both", expand=True, padx=8, pady=(0, 4))
+        self.details = tk.Text(det, height=16, width=96, wrap="none",
+                               font=("Courier", 10), state="disabled")
+        sy = tk.Scrollbar(det, orient="vertical", command=self.details.yview)
+        sx = tk.Scrollbar(det, orient="horizontal", command=self.details.xview)
+        self.details.config(yscrollcommand=sy.set, xscrollcommand=sx.set)
+        sy.pack(side="right", fill="y")
+        sx.pack(side="bottom", fill="x")
+        self.details.pack(side="left", fill="both", expand=True)
+
         self.new_image()
 
     # ---- helpers
+    def _show_details(self, text: str):
+        self.details.config(state="normal")
+        self.details.delete("1.0", "end")
+        self.details.insert("1.0", text)
+        self.details.config(state="disabled")
+
     def _read_size(self):
         try:
             w, h = int(self.w_var.get()), int(self.h_var.get())
@@ -239,6 +326,9 @@ class App(tk.Tk):
             w, h = self.editor.w, self.editor.h
             pixels = self.editor.get_pixels()
             csize = save_compressed(path, w, h, pixels)
+            self._show_details(build_report(
+                w, h, pixels, encode(pixels),
+                f"COMPRESSION of {os.path.basename(path)}"))
             rsize = HEADER_SIZE + len(pixels)
             ratio = csize / rsize * 100
             gain = 100 - ratio
@@ -254,6 +344,10 @@ class App(tk.Tk):
             if not path:
                 return
             w, h, pixels = load_compressed(path)
+            _, _, stream = load_compressed_stream(path)
+            self._show_details(build_report(
+                w, h, pixels, stream,
+                f"DECOMPRESSION of {os.path.basename(path)}"))
             self.viewer.set_image(w, h, pixels)
             same = ""
             if (w, h) == (self.editor.w, self.editor.h):
