@@ -38,7 +38,7 @@
 
 ## 📸 Screenshot
 
-![RLE Codec Studio Screenshot](Capture d'écran 2026-10-11 180025.png)
+![RLE Codec Studio Screenshot]((Capture d'écran 2026-10-11 180025.png)
 
 ---
 
